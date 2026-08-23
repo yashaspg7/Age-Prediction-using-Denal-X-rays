@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 CBCT_ROOT = ROOT / "data_cbct"
 METADATA_PATH = CBCT_ROOT / "metadata.ini"
 SKIP_SECTIONS = {"project", "acquisition", "preprocessing", "images"}
-PIPELINE_DURATION_SEC = 5.0
+PIPELINE_DURATION_SEC = 3.0
 
 
 def load_metadata(path: Path = METADATA_PATH) -> ConfigParser:
@@ -217,7 +217,7 @@ def run_prediction_pipeline(
         return None
 
     result = entry_as_result(config, section)
-    status_box.success(f"Prediction complete — {result['display_name']}")
+    status_box.success("Prediction complete.")
     return result
 
 
@@ -300,7 +300,6 @@ def main() -> None:
         if result is None:
             return
 
-        st.subheader("Prediction Output")
         st.code(format_results(result), language="text")
 
 
