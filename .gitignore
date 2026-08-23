@@ -1,4 +1,6 @@
 # python, and other bs
+__pycache__/
+*.py[cod]
 .ruff_cache
 .ipynb_checkpoints
 .venv
