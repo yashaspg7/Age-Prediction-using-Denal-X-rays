@@ -2,6 +2,7 @@
 .ruff_cache
 .ipynb_checkpoints
 .venv
+.virtual_documents
 
 # Macos
 .DS_Store
