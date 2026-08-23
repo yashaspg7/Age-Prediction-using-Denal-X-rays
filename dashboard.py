@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from configparser import ConfigParser
-from pathlib import Path
+from functools import lru_cache
+from pathlib import Path, PurePosixPath
 
 import cv2
 import numpy as np
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
-METADATA_PATH = ROOT / "data_cbct" / "metadata.ini"
+CBCT_ROOT = ROOT / "data_cbct"
+METADATA_PATH = CBCT_ROOT / "metadata.ini"
 SKIP_SECTIONS = {"project", "acquisition", "preprocessing", "images"}
-PIPELINE_DURATION_SEC = 10.0
+PIPELINE_DURATION_SEC = 5.0
 
 
 def load_metadata(path: Path = METADATA_PATH) -> ConfigParser:
@@ -27,77 +31,113 @@ def subject_sections(config: ConfigParser) -> list[str]:
     return [section for section in config.sections() if section not in SKIP_SECTIONS]
 
 
-def count_white_pixels(image_bytes: bytes) -> int | None:
-    array = np.frombuffer(image_bytes, dtype=np.uint8)
+def normalize_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9@._]+", "", value.lower())
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def image_stats(data: bytes) -> tuple[int, int, int] | None:
+    array = np.frombuffer(data, dtype=np.uint8)
     image = cv2.imdecode(array, cv2.IMREAD_GRAYSCALE)
     if image is None:
         return None
-    return int(cv2.countNonZero(image))
+    height, width = image.shape
+    return width, height, int(cv2.countNonZero(image))
 
 
-def filename_hints(name: str) -> set[str]:
-    hints: set[str] = set()
-    lowered = name.lower()
-    hints.add(lowered)
-    stem = Path(name).stem.lower()
-    hints.add(stem)
-    hints.add(stem.replace("_pulp", "").replace("_tooth", "").replace("-pulp", "").replace("-tooth", ""))
-    if "@" in stem:
-        hints.add(stem.split("@")[0])
-        hints.add(stem.split("@")[-1])
-    return {hint for hint in hints if hint}
+@lru_cache(maxsize=1)
+def build_patient_image_index() -> tuple[dict, ...]:
+    """Index every local CBCT folder that contains pulp.bmp and tooth.bmp."""
+    index: list[dict] = []
+
+    if not CBCT_ROOT.exists():
+        return tuple(index)
+
+    for pulp_path in CBCT_ROOT.rglob("pulp.bmp"):
+        tooth_path = pulp_path.parent / "tooth.bmp"
+        if not tooth_path.is_file():
+            continue
+
+        pulp_bytes = pulp_path.read_bytes()
+        tooth_bytes = tooth_path.read_bytes()
+        pulp_stats = image_stats(pulp_bytes)
+        tooth_stats = image_stats(tooth_bytes)
+        if pulp_stats is None or tooth_stats is None:
+            continue
+
+        rel_location = pulp_path.parent.relative_to(ROOT).as_posix()
+        index.append(
+            {
+                "image_location": rel_location,
+                "folder_name": pulp_path.parent.name,
+                "pulp_hash": sha256_bytes(pulp_bytes),
+                "tooth_hash": sha256_bytes(tooth_bytes),
+                "pulp_stats": pulp_stats,
+                "tooth_stats": tooth_stats,
+            }
+        )
+
+    return tuple(index)
 
 
-def match_subject(
-    config: ConfigParser,
-    pulp_name: str,
-    tooth_name: str,
-    pulp_pixels: int | None,
-    tooth_pixels: int | None,
-) -> tuple[str | None, str]:
-    hints = filename_hints(pulp_name) | filename_hints(tooth_name)
-    best_section: str | None = None
+def stats_distance(left: tuple[int, int, int], right: tuple[int, int, int]) -> int:
+    return sum(abs(a - b) for a, b in zip(left, right))
+
+
+def match_patient_from_images(
+    pulp_bytes: bytes,
+    tooth_bytes: bytes,
+) -> tuple[dict | None, str]:
+    """Identify patient by comparing uploads to on-disk CBCT image pairs."""
+    index = build_patient_image_index()
+    if not index:
+        return None, "no local index"
+
+    pulp_hash = sha256_bytes(pulp_bytes)
+    tooth_hash = sha256_bytes(tooth_bytes)
+
+    for entry in index:
+        if entry["pulp_hash"] == pulp_hash and entry["tooth_hash"] == tooth_hash:
+            return entry, "exact image match"
+
+    pulp_stats = image_stats(pulp_bytes)
+    tooth_stats = image_stats(tooth_bytes)
+    if pulp_stats is None or tooth_stats is None:
+        return None, "invalid image"
+
+    best_entry: dict | None = None
     best_score = float("inf")
-    best_reason = ""
+
+    for entry in index:
+        score = stats_distance(pulp_stats, entry["pulp_stats"]) + stats_distance(
+            tooth_stats, entry["tooth_stats"]
+        )
+        if score < best_score:
+            best_score = score
+            best_entry = entry
+
+    if best_entry is not None and best_score == 0:
+        return best_entry, "image fingerprint match"
+
+    return None, "no image match"
+
+
+def section_for_image_location(config: ConfigParser, image_location: str) -> str | None:
+    target = normalize_key(image_location)
+    target_folder = normalize_key(PurePosixPath(image_location).name)
 
     for section in subject_sections(config):
         entry = config[section]
-        display = entry.get("display_name", section).lower()
-        location = entry.get("image_location", section).lower()
-        score = 0.0
-        reasons: list[str] = []
+        location = entry.get("image_location", "")
+        if normalize_key(location) == target:
+            return section
+        if normalize_key(PurePosixPath(location).name) == target_folder:
+            return section
 
-        if any(hint and (hint in display or hint in location) for hint in hints):
-            score -= 1000
-            reasons.append("filename match")
-
-        if pulp_pixels is not None and tooth_pixels is not None:
-            expected_pulp = int(entry.get("white_pixels_pulp", "0"))
-            expected_tooth = int(entry.get("white_pixels_tooth", "0"))
-            pixel_delta = abs(pulp_pixels - expected_pulp) + abs(tooth_pixels - expected_tooth)
-            score += pixel_delta
-            if pixel_delta < 500:
-                reasons.append("pixel fingerprint")
-
-        if score < best_score:
-            best_score = score
-            best_section = section
-            best_reason = ", ".join(reasons) if reasons else "nearest cohort match"
-
-    return best_section, best_reason
-
-
-def format_results(entry: dict) -> str:
-    return (
-        f"truth label : {entry['truth_label']}\n"
-        f"pred label  : {entry['pred_label']}\n"
-        f"\n"
-        f"Naive PTR   : {entry['ptr_naive']}\n"
-        f"PTR         : {entry['ptr_scale_length']}\n"
-        f"A(pulp)     : {entry['pulp_area']}\n"
-        f"A(tooth)    : {entry['tooth_area']}\n"
-        f"MAE         : {entry['mae']}"
-    )
+    return None
 
 
 def entry_as_result(config: ConfigParser, section: str) -> dict:
@@ -115,18 +155,29 @@ def entry_as_result(config: ConfigParser, section: str) -> dict:
     }
 
 
+def format_results(entry: dict) -> str:
+    return (
+        f"truth label : {entry['truth_label']}\n"
+        f"pred label  : {entry['pred_label']}\n"
+        f"\n"
+        f"Naive PTR   : {entry['ptr_naive']}\n"
+        f"PTR         : {entry['ptr_scale_length']}\n"
+        f"A(pulp)     : {entry['pulp_area']}\n"
+        f"A(tooth)    : {entry['tooth_area']}\n"
+        f"MAE         : {entry['mae']}"
+    )
+
+
 def run_prediction_pipeline(
     config: ConfigParser,
     pulp_bytes: bytes,
     tooth_bytes: bytes,
-    pulp_name: str,
-    tooth_name: str,
     progress_bar: st.progress,
     status_box: st.empty,
-) -> tuple[dict | None, str]:
+) -> dict | None:
     stages = [
         (0.15, "Loading images…"),
-        (0.35, "Segmentation mask validation…"),
+        (0.35, "Matching uploads to CBCT cohort images…"),
         (0.55, "Computing naive PTR…"),
         (0.72, "Applying scale normalization…"),
         (0.88, "Predicting age from PTR model…"),
@@ -135,34 +186,39 @@ def run_prediction_pipeline(
 
     step_delay = PIPELINE_DURATION_SEC / len(stages)
 
-    pulp_pixels: int | None = None
-    tooth_pixels: int | None = None
-
     for fraction, message in stages:
         status_box.info(message)
         progress_bar.progress(fraction)
         time.sleep(step_delay)
 
-        if fraction == 0.35:
-            pulp_pixels = count_white_pixels(pulp_bytes)
-            tooth_pixels = count_white_pixels(tooth_bytes)
-            if pulp_pixels is None or tooth_pixels is None:
-                status_box.error("Could not decode one or both uploaded images.")
-                return None, "invalid image"
+    patient, match_reason = match_patient_from_images(pulp_bytes, tooth_bytes)
+    if patient is None:
+        if match_reason == "no local index":
+            status_box.error(
+                "No CBCT image folders found under `data_cbct/`. "
+                "Each patient folder needs `pulp.bmp` and `tooth.bmp`."
+            )
+        elif match_reason == "invalid image":
+            status_box.error("Could not decode one or both uploaded images.")
+        else:
+            status_box.error(
+                "Could not match these uploads to any CBCT folder under `data_cbct/`. "
+                "Make sure you upload the exact `pulp.bmp` and `tooth.bmp` from the same patient folder."
+            )
+        return None
 
-    section, reason = match_subject(
-        config, pulp_name, tooth_name, pulp_pixels, tooth_pixels
-    )
+    section = section_for_image_location(config, patient["image_location"])
     if section is None:
-        status_box.error("No matching subject found in metadata.ini.")
-        return None, "no match"
+        status_box.error(
+            f"Identified patient folder **`{patient['folder_name']}`** "
+            f"({match_reason}), but no entry exists in `metadata.ini` / "
+            f"`normalisation.csv` for `{patient['image_location']}`."
+        )
+        return None
 
     result = entry_as_result(config, section)
-    result["match_reason"] = reason
-    result["detected_pulp_pixels"] = pulp_pixels
-    result["detected_tooth_pixels"] = tooth_pixels
-    status_box.success("Prediction complete.")
-    return result, reason
+    status_box.success(f"Prediction complete — {result['display_name']}")
+    return result
 
 
 def configure_page() -> None:
@@ -175,23 +231,28 @@ def configure_page() -> None:
 
 def render_sidebar(config: ConfigParser) -> None:
     project = config["project"]
+    indexed = len(build_patient_image_index())
     st.sidebar.title("CBCT Dashboard")
     st.sidebar.markdown(f"**Dataset:** {project.get('dataset', 'CBCT cohort')}")
-    st.sidebar.markdown(f"**Subjects:** {project.get('total_subjects', '?')}")
+    st.sidebar.markdown(f"**Subjects in metadata:** {project.get('total_subjects', '?')}")
+    st.sidebar.markdown(f"**Local CBCT folders indexed:** {indexed}")
     st.sidebar.markdown(f"**Age groups:** {project.get('age_groups', '—')}")
     st.sidebar.divider()
-    st.sidebar.caption("Upload one pulp mask and one tooth mask, then run prediction.")
+    st.sidebar.caption(
+        "Upload `pulp.bmp` and `tooth.bmp`. The app matches them against "
+        "patient folders under `data_cbct/` on this machine."
+    )
 
 
 def main() -> None:
     configure_page()
     config = load_metadata()
 
-    st.title("Age Prediction using Dental X-rays")
+    st.title("CBCT Pulp / Tooth Age Prediction")
     st.markdown(
         "Upload segmented **pulp** and **tooth** images. "
-        "The dashboard reads cohort metadata from `metadata.ini` and reports "
-        "normalized PTR metrics and predicted age."
+        "The dashboard matches your uploads to CBCT folders on disk, "
+        "then reads normalized PTR metrics and predicted age from `metadata.ini`."
     )
 
     render_sidebar(config)
@@ -228,15 +289,10 @@ def main() -> None:
         progress = st.progress(0)
         status = st.empty()
 
-        pulp_bytes = pulp_file.getvalue()
-        tooth_bytes = tooth_file.getvalue()
-
-        result, _ = run_prediction_pipeline(
+        result = run_prediction_pipeline(
             config,
-            pulp_bytes,
-            tooth_bytes,
-            pulp_file.name,
-            tooth_file.name,
+            pulp_file.getvalue(),
+            tooth_file.getvalue(),
             progress,
             status,
         )
