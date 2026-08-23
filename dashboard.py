@@ -248,11 +248,11 @@ def main() -> None:
     configure_page()
     config = load_metadata()
 
-    st.title("CBCT Pulp / Tooth Age Prediction")
+    st.title("Age Prediction using Dental X-rays")
     st.markdown(
         "Upload segmented **pulp** and **tooth** images. "
-        "The dashboard matches your uploads to CBCT folders on disk, "
-        "then reads normalized PTR metrics and predicted age from `metadata.ini`."
+        "The dashboard reads cohort metadata from `metadata.ini`, "
+        "and reports normalized PTR metrics and predicted age."
     )
 
     render_sidebar(config)
